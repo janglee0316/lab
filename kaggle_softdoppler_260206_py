@@ -170,8 +170,8 @@ class SimCfg:
     rician_K_db: float = 10.0
 
     # Doppler forced range (Hz)
-    ut_doppler_hz_min: float = 60.0
-    ut_doppler_hz_max: float = 90.0
+    ut_doppler_hz_min: float = 70.0
+    ut_doppler_hz_max: float = 100.0
 
     coherence_ms: float = 1.0
     pilot_snr_db: float = 15.0
@@ -181,8 +181,8 @@ class SimCfg:
     w_out: int = 15  # horizon
 
     # Dataset size
-    train_samples: int = 80000
-    val_samples: int = 9000
+    train_samples: int = 90000
+    val_samples: int = 10000
 
     # Normalize + store
     use_rms_norm: bool = True
@@ -190,13 +190,13 @@ class SimCfg:
 
     # Channel realism
     small_angular_spread: bool = True
-    as_std_deg: float = 2.0
+    as_std_deg: float = 0.3
     doppler_path_std_hz: float = 1.0
     doppler_rw_std_hz: float = 0.0
 
     # Training
     batch_size: int = 100
-    epochs: int = 300
+    epochs: int = 400
     lr: float = 1e-3
     weight_decay: float = 0.0
     early_stop_patience: int = 60
