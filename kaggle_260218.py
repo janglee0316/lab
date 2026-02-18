@@ -2,22 +2,10 @@
 """
 LEO Massive MIMO Channel Prediction: All-in-One Suite (Jupyter/Kaggle-friendly) - TDNN-adv Update
 
-What changed (high-impact, parameter-driven):
-1) Channel is no longer "almost scalar complex rotation".
-   - Adds AoA random-walk (spatial pattern drift)
-   - Adds per-path Doppler dispersion + Doppler random-walk + occasional jumps
-   - Adds path-gain AR(1) evolution
-   - Optional pilot outliers
-   => This fairly weakens scalar AR(1) KalmanFilter baseline (model mismatch).
-
-2) TDNN-KalmanNet is strengthened:
-   - x_post initialized from observation (helps short horizon)
-   - richer features: (y, dy, ddy)
-   - TCN-style encoder (1x1 conv to H + dilated residual blocks)
-   - GRU rollout head (reduces long-horizon drift)
-   - horizon-weighted loss (tail + first-step boost)
-
-3) SCP baseline upgraded to Seq2Seq (encoder-decoder) with optional teacher forcing.
+KF baseline UPDATED:
+- Replace the previous heuristic AR1KalmanScalar with a standard-form (simple) Kalman Filter:
+    x_k = a x_{k-1} + w_k,  y_k = x_k + v_k
+  with explicit Q/R knobs, optional MMSE-debias, and optional smoothed a-estimation.
 """
 
 import os, math, time, json, csv, argparse, random, shutil, sys
@@ -173,7 +161,7 @@ class SimCfg:
     num_paths: int = 6
 
     # Residual Doppler range (Hz)
-    ut_doppler_hz_min: float = 50.0
+    ut_doppler_hz_min: float = 0.0
     ut_doppler_hz_max: float = 100.0
 
     # Coherence interval Ts (ms)
@@ -182,7 +170,7 @@ class SimCfg:
     # Pilot SNR (dB)
     pilot_snr_db: float = 15.0
 
-    # Pilot outliers (to weaken KF fairly under impulsive estimation errors)
+    # Pilot outliers
     pilot_outlier_prob: float = 0.0
     pilot_outlier_scale: float = 8.0
 
@@ -193,42 +181,42 @@ class SimCfg:
     # Dataset size
     train_samples: int = 90000
     val_samples: int = 10000
-
+    
     # Normalize + store
     use_rms_norm: bool = True
     dataset_store_fp16: bool = True
 
-    # Spatial / Doppler nonstationarity knobs (key for "TDNN-adv")
+    # Spatial / Doppler nonstationarity knobs
     small_angular_spread: bool = True
     as_std_deg: float = 0.2
-    aoa_rw_std_deg: float = 0.05        # NEW: LoS/cluster AoA random-walk per step
+    aoa_rw_std_deg: float = 0.0
     doppler_path_std_hz: float = 0.3
-    doppler_rw_std_hz: float = 3.0     # NEW: Doppler random-walk per step
-    doppler_jump_prob: float = 0.05     # NEW: occasional Doppler jumps
-    doppler_jump_std_hz: float = 40.0
-    phase_noise_std_rad: float = 0.0   # NEW: incremental phase noise per step
+    doppler_rw_std_hz: float = 0.0
+    doppler_jump_prob: float = 0.0
+    doppler_jump_std_hz: float = 0.0
+    phase_noise_std_rad: float = 0.0
 
-    # Path gain evolution (breaks pure rotation)
-    gain_ar_rho: float = 1.0           # 1.0 = static gain
-    gain_ar_std: float = 0.0           # innovation std (complex)
+    # Path gain evolution
+    gain_ar_rho: float = 1.0
+    gain_ar_std: float = 0.0
 
     # Training
     batch_size: int = 100
-    epochs: int = 450
+    epochs: int = 450    
     lr: float = 8e-4
     weight_decay: float = 0.0
     early_stop_patience: int = 90
 
-    # Horizon-weighted loss (helps TDNN dominate tail without sacrificing first step)
-    loss_tail_weight: float = 1.5      # how much to emphasize far horizon
+    # Horizon-weighted loss
+    loss_tail_weight: float = 1.5
     loss_gamma: float = 2.0
-    loss_first_boost: float = 0.8      # extra weight on first (short-horizon) step
+    loss_first_boost: float = 0.8
 
     # SCP (Seq2Seq)
     scp_hidden: int = 256
     scp_layers: int = 2
     dropout: float = 0.25
-    scp_tf_ratio: float = 0.5          # teacher forcing during training
+    scp_tf_ratio: float = 0.5
 
     # KalmanNet(GRU)
     knet_hidden: int = 256
@@ -250,6 +238,30 @@ class SimCfg:
     # Plots / latency
     make_aging_plots: bool = True
     measure_latency: bool = True
+
+    # -------- NEW: Standard KF knobs --------
+    # If True, undo MMSE shrinkage: z = y / beta  (beta = snr/(1+snr))
+    kf_debias_mmse: bool = True
+        # -------- KF robustness / adaptivity (ADD) --------
+    kf_gate_sigma: float = 0.0        # 0이면 게이팅 off, 보통 2.5~4 추천
+    kf_adapt_Q: bool = False           # mismatch 크면 True 추천
+    kf_Q_alpha: float = 0.02          # Q 적응 속도(0.01~0.05)
+    kf_Q_min: float = 5e-4
+    kf_Q_max: float = 5e-2
+    # -----------------------------------------------
+
+
+    # "adaptive_ls": estimate a from consecutive measurements with smoothing
+    # "fixed_from_doppler": fixed a = exp(j 2pi fD Ts) using mean doppler magnitude
+    kf_a_mode: str = "adaptive_ls"
+    kf_a_smooth: float = 0.25         # smoothing for adaptive a
+    kf_mag_clip: float = 0.995       # keep |a| < 1 for stability
+
+    kf_init_P: float = 1.0            # initial error variance
+    kf_Q: float = 6e-3                # process noise variance (increase when mismatch grows)
+    kf_R_scale: float = 2.0           # measurement noise scaling (R = scale/snr_lin)
+    kf_R_floor: float = 1e-6          # avoid zero division / overconfidence
+    # ---------------------------------------
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -273,22 +285,16 @@ class SimCfg:
         return self.tdnn_blocks_small if self.q_in <= 7 else self.tdnn_blocks_large
 
     def horizon_loss_weights(self) -> torch.Tensor:
-        # weights for t=1..L
         t = torch.arange(1, self.w_out + 1).float()
         base = 1.0 + self.loss_tail_weight * ((t / self.w_out) ** self.loss_gamma)
         base[0] += self.loss_first_boost
-        # normalize mean to 1 for stable LR behavior
         return base / base.mean()
 
 
 # -------------------------
-# 2) Channel Model (nonstationary + spatial drift option)
+# 2) Channel Model
 # -------------------------
 class LEOMassiveMIMOChannel:
-    """
-    Synthetic LEO massive MIMO channel with controllable nonstationarity.
-    Key idea: break "single complex scalar rotation" by allowing AoA drift + per-path Doppler differences + gain drift.
-    """
     def __init__(self, cfg: SimCfg, device=None):
         self.cfg = cfg
         self.device = torch.device(device if device else cfg.device)
@@ -298,7 +304,7 @@ class LEOMassiveMIMOChannel:
         self.w_nlos = math.sqrt(1.0 / (K_lin + 1.0))
 
         self.P = int(cfg.num_paths)
-        self.f0 = 2.0e9  # used for static delay phase term
+        self.f0 = 2.0e9
         self.reset()
 
     def _upa_response(self, theta, phi):
@@ -313,19 +319,15 @@ class LEOMassiveMIMOChannel:
         return u / (torch.norm(u) + 1e-12)
 
     def reset(self):
-        # Angles
         self.theta_los = (torch.rand(1, device=self.device) * 0.5 * math.pi)
         self.phi_los = (torch.rand(1, device=self.device) * 2.0 * math.pi)
 
-        # residual doppler (Hz)
         mag = random.uniform(self.cfg.ut_doppler_hz_min, self.cfg.ut_doppler_hz_max)
         sgn = -1.0 if random.random() < 0.5 else 1.0
         self.fD_ut = float(sgn * mag)
 
-        # LoS phase (incremental)
         self.phase_los = float(random.uniform(0, 2 * math.pi))
 
-        # NLoS cluster angles around LoS
         if self.cfg.small_angular_spread:
             as_std = (self.cfg.as_std_deg / 180.0) * math.pi
             self.theta_p = torch.clamp(
@@ -337,20 +339,13 @@ class LEOMassiveMIMOChannel:
             self.theta_p = torch.rand(self.P, device=self.device) * 0.5 * math.pi
             self.phi_p = torch.rand(self.P, device=self.device) * 2.0 * math.pi
 
-        # Per-path doppler around LoS doppler
         self.fD_p = torch.ones(self.P, device=self.device) * float(self.fD_ut)
         self.fD_p += torch.randn_like(self.fD_p) * self.cfg.doppler_path_std_hz
 
-        # Per-path phases (incremental)
         self.phase_p = torch.empty(self.P, device=self.device).uniform_(0, 2 * math.pi)
-
-        # Static delay term
         self.tau_p = torch.empty(self.P, device=self.device).uniform_(0, 200e-9)
-
-        # Path complex gains (with optional AR evolution)
         self.g = complex_normal((self.P,), device=self.device, std=1.0)
 
-        # Steering vectors
         self.u_los = self._upa_response(self.theta_los, self.phi_los)
         self.u_p = torch.stack([self._upa_response(self.theta_p[i], self.phi_p[i]) for i in range(self.P)])
 
@@ -360,20 +355,17 @@ class LEOMassiveMIMOChannel:
         self.t_idx += 1
         Ts = self.cfg.Ts_s
 
-        # --- AoA drift (break scalar rotation across antennas) ---
         if self.cfg.aoa_rw_std_deg > 0.0:
             rw = (self.cfg.aoa_rw_std_deg / 180.0) * math.pi
             self.theta_los = torch.clamp(self.theta_los + torch.randn_like(self.theta_los) * rw, 0.0, 0.5 * math.pi)
             self.phi_los = self.phi_los + torch.randn_like(self.phi_los) * rw
 
-            # cluster follows LoS with small extra jitter
             self.theta_p = torch.clamp(self.theta_p + torch.randn_like(self.theta_p) * (0.7 * rw), 0.0, 0.5 * math.pi)
             self.phi_p = self.phi_p + torch.randn_like(self.phi_p) * (0.7 * rw)
 
             self.u_los = self._upa_response(self.theta_los, self.phi_los)
             self.u_p = torch.stack([self._upa_response(self.theta_p[i], self.phi_p[i]) for i in range(self.P)])
 
-        # --- Doppler random walk + occasional jumps ---
         if self.cfg.doppler_rw_std_hz > 0.0:
             self.fD_p = self.fD_p + torch.randn_like(self.fD_p) * self.cfg.doppler_rw_std_hz
             self.fD_ut = float(self.fD_ut + random.gauss(0.0, self.cfg.doppler_rw_std_hz))
@@ -383,7 +375,6 @@ class LEOMassiveMIMOChannel:
             self.fD_ut = float(self.fD_ut + jump)
             self.fD_p = self.fD_p + (torch.randn_like(self.fD_p) * 0.3 + 1.0) * jump
 
-        # --- Incremental phase update ---
         pn = self.cfg.phase_noise_std_rad
         if pn > 0.0:
             self.phase_los = float(self.phase_los + 2 * math.pi * self.fD_ut * Ts + random.gauss(0.0, pn))
@@ -392,7 +383,6 @@ class LEOMassiveMIMOChannel:
             self.phase_los = float(self.phase_los + 2 * math.pi * self.fD_ut * Ts)
             self.phase_p = self.phase_p + (2 * math.pi * self.fD_p * Ts)
 
-        # --- Path gain AR(1) evolution (break pure rotation) ---
         if self.cfg.gain_ar_std > 0.0 and self.cfg.gain_ar_rho < 1.0:
             rho = float(self.cfg.gain_ar_rho)
             innov = complex_normal(self.g.shape, device=self.device, std=self.cfg.gain_ar_std)
@@ -400,7 +390,6 @@ class LEOMassiveMIMOChannel:
 
     def get_h_true(self):
         los = self.w_los * torch.exp(1j * torch.tensor(self.phase_los, device=self.device)) * self.u_los
-
         nlos_phase = self.phase_p - 2 * math.pi * self.f0 * self.tau_p
         coeff = self.g * torch.exp(1j * nlos_phase)
         nlos = self.w_nlos * (coeff[:, None] * self.u_p).sum(dim=0) / math.sqrt(self.P)
@@ -408,7 +397,6 @@ class LEOMassiveMIMOChannel:
 
 
 def mmse_estimate_from_pilot(h_true: torch.Tensor, snr_db: float, cfg: SimCfg, device: torch.device):
-    # scalar MMSE shrinkage + optional outlier
     snr_lin = 10 ** (snr_db / 10.0)
     sig_pow = torch.mean(torch.abs(h_true) ** 2).real
     noise_var = sig_pow / snr_lin
@@ -424,7 +412,7 @@ def mmse_estimate_from_pilot(h_true: torch.Tensor, snr_db: float, cfg: SimCfg, d
 
 
 # -------------------------
-# 3) Dataset Generation (target after delay A)
+# 3) Dataset Generation
 # -------------------------
 def dataset_path(base_dir: str, cfg: SimCfg, A: int):
     tag = (
@@ -464,11 +452,11 @@ def generate_dataset_tensors(cfg: SimCfg, n_samples: int, A: int):
             seq_obs.append(vectorize_complex(y).to("cpu"))
             chan.step()
 
-        seq_obs = torch.stack(seq_obs)    # (total, D)
-        seq_true = torch.stack(seq_true)  # (total, D)
+        seq_obs = torch.stack(seq_obs)
+        seq_true = torch.stack(seq_true)
 
         x_raw = seq_obs[:cfg.q_in]
-        y_raw = seq_true[cfg.q_in + A : cfg.q_in + A + cfg.w_out]  # TRUE after delay A
+        y_raw = seq_true[cfg.q_in + A : cfg.q_in + A + cfg.w_out]
 
         if cfg.use_rms_norm:
             x_n, sc = rms_normalize(x_raw)
@@ -513,60 +501,142 @@ class SliceDataset(torch.utils.data.Dataset):
     def __getitem__(self, i):
         return self.X[i], self.Y[i]
 
-
 # -------------------------
-# 4) Baseline: AR(1)-KF on complex scalar rotation (kept same; channel mismatch will degrade it)
+# 4) Baseline: Improved Standard KF (Diagonal complex AR(1))
 # -------------------------
-def estimate_a_ls(y_prev: torch.Tensor, y_curr: torch.Tensor, eps: float = 1e-12):
-    hp = devectorize_complex(y_prev.float())
-    hc = devectorize_complex(y_curr.float())
-    a = torch.sum(torch.conj(hp) * hc) / (torch.sum(torch.conj(hp) * hp) + eps)
-    return a
+def complex_abs2(z: torch.Tensor) -> torch.Tensor:
+    # z: complex tensor
+    return (z.real * z.real + z.imag * z.imag)
 
-def apply_a_power(x_vec: torch.Tensor, a: complex, k: int) -> torch.Tensor:
-    x = devectorize_complex(x_vec.float())
-    ak = (a ** k)
-    y = ak * x
-    return vectorize_complex(y).to(x_vec.device)
+def estimate_a_ls_global(z_prev_c: torch.Tensor, z_curr_c: torch.Tensor, eps: float = 1e-12) -> complex:
+    # global complex LS a minimizing ||z_curr - a z_prev||^2 over all dims
+    num = torch.sum(torch.conj(z_prev_c) * z_curr_c)
+    den = torch.sum(torch.conj(z_prev_c) * z_prev_c) + eps
+    a = num / den
+    mag = float(torch.abs(a).item())
+    ang = float(torch.angle(a).item())
+    return mag * complex(math.cos(ang), math.sin(ang))
 
-class AR1KalmanScalar:
-    def __init__(self, D: int, snr_db: float = 15.0):
-        self.D = D
-        snr_lin = 10 ** (snr_db / 10.0)
-        self.R = float(1.0 / (snr_lin + 1.0))
+class SimpleKalmanAR1_DiagComplex:
+    """
+    Standard-form KF with diagonal (element-wise) complex AR(1):
+        x_k[m] = a[m] x_{k-1}[m] + w_k[m]
+        z_k[m] = x_k[m] + v_k[m]
+    where w,v are complex, and we track diagonal variances P[m].
+
+    Key upgrades vs scalar-a, scalar-P:
+      - a is complex vector (per antenna element) estimated by element-wise LS + smoothing
+      - P is diagonal vector (per element)
+      - innovation gating for robustness (outliers / sudden mismatch)
+      - optional adaptive Q driven by innovation energy
+    """
+    def __init__(self, cfg: SimCfg):
+        self.cfg = cfg
+        self.M = cfg.M
+        self.D = cfg.feat_dim
+
+        snr_lin = 10 ** (cfg.pilot_snr_db / 10.0)
+        self.beta = float(snr_lin / (1.0 + snr_lin))
+
+        # R is complex variance E|v|^2 (normalized domain에서는 대략 1/snr_lin 스케일이 무난)
+        self.R = float(max(cfg.kf_R_floor, cfg.kf_R_scale / max(1e-12, snr_lin)))
+        self.Q = float(max(0.0, cfg.kf_Q))
+
+        # init a
+        if cfg.kf_a_mode == "fixed_from_doppler":
+            fd = 0.5 * (cfg.ut_doppler_hz_min + cfg.ut_doppler_hz_max)
+            phi = 2.0 * math.pi * fd * cfg.Ts_s
+            a0 = complex(math.cos(phi), math.sin(phi))  # |a|=1
+            self.a = torch.full((self.M,), fill_value=a0, dtype=torch.complex64)
+        else:
+            self.a = torch.ones((self.M,), dtype=torch.complex64)
+
         self.reset()
 
     def reset(self):
-        self.x = None
-        self.P = 1.0
-        self.a = 1.0 + 0j
-        self.prev_y = None
+        self.x = None                  # complex (M,)
+        self.P = torch.full((self.M,), float(self.cfg.kf_init_P), dtype=torch.float32)  # diag var
+        self.prev_z = None             # complex (M,)
 
-    def update(self, y_vec: torch.Tensor):
-        if self.prev_y is not None:
-            a_hat = estimate_a_ls(self.prev_y, y_vec)
-            mag = float(torch.abs(a_hat).clamp(0.0, 0.9995).item())
-            ang = float(torch.angle(a_hat).item())
-            self.a = mag * complex(math.cos(ang), math.sin(ang))
-        self.prev_y = y_vec.clone()
+    def _prep_meas(self, y_vec: torch.Tensor) -> torch.Tensor:
+        # y_vec: (D,) real/imag stacked
+        z = devectorize_complex(y_vec.float()).cpu().to(torch.complex64)  # (M,)
+        if self.cfg.kf_debias_mmse:
+            z = z / max(1e-12, self.beta)
+        return z
 
-        if self.x is None:
-            self.x = y_vec.clone()
+    def _update_a(self, z: torch.Tensor):
+        if self.cfg.kf_a_mode != "adaptive_ls":
+            return
+        if self.prev_z is None:
+            self.prev_z = z.clone()
             return
 
-        x_pri = apply_a_power(self.x, self.a, 1).cpu()
-        a2 = (abs(self.a) ** 2)
-        Q = max(1e-5, (1.0 - a2) * 0.5)
-        P_pri = a2 * self.P + Q
+        eps = 1e-8
+        denom = complex_abs2(self.prev_z) + eps  # (M,)
+        a_hat = (torch.conj(self.prev_z) * z) / denom  # element-wise LS
 
-        K = P_pri / (P_pri + self.R)
-        self.x = x_pri + K * (y_vec - x_pri)
+        # 안정화: prev가 너무 작은 element는 global a로 대체
+        global_a = estimate_a_ls_global(self.prev_z, z)
+        small = denom < 1e-6
+        if torch.any(small):
+            a_hat = a_hat.clone()
+            a_hat[small] = complex(global_a.real, global_a.imag)
+
+        # smoothing
+        lam = float(self.cfg.kf_a_smooth)
+        self.a = (1.0 - lam) * self.a + lam * a_hat
+
+        # magnitude clip (stability)
+        mag = torch.abs(self.a).clamp(max=float(self.cfg.kf_mag_clip))
+        self.a = self.a / (torch.abs(self.a) + 1e-12) * mag
+
+        self.prev_z = z.clone()
+
+    def update(self, y_vec: torch.Tensor):
+        z = self._prep_meas(y_vec)
+        self._update_a(z)
+
+        if self.x is None:
+            self.x = z.clone()
+            return
+
+        # Predict
+        x_pri = self.a * self.x
+        P_pri = (torch.abs(self.a) ** 2) * self.P + self.Q  # (M,)
+
+        # Innovation
+        innov = z - x_pri
+        S = P_pri + self.R  # (M,)
+
+        # Gating (robust to outliers / big mismatch)
+        g = float(self.cfg.kf_gate_sigma)
+        if g > 0.0:
+            mask = complex_abs2(innov) <= (g * g) * S
+            K = torch.where(mask, P_pri / (S + 1e-12), torch.zeros_like(P_pri))
+        else:
+            K = P_pri / (S + 1e-12)
+
+        # Update
+        self.x = x_pri + K * innov
         self.P = (1.0 - K) * P_pri
+
+        # Optional adaptive Q (innovation-driven)
+        if bool(self.cfg.kf_adapt_Q):
+            # 평균 혁신 에너지 기반으로 Q를 조금씩 따라가게(너무 커지면 발산 방지)
+            e2 = float(torch.mean(complex_abs2(innov)).item())
+            # 대략 (E|innov|^2 - R) 쪽이 process 불확실성 힌트
+            q_hat = max(0.0, e2 - self.R)
+            a = float(self.cfg.kf_Q_alpha)
+            self.Q = (1.0 - a) * self.Q + a * q_hat
+            self.Q = float(min(max(self.Q, self.cfg.kf_Q_min), self.cfg.kf_Q_max))
 
     def predict_ahead(self, steps: int) -> torch.Tensor:
         if self.x is None:
             return torch.zeros(self.D)
-        return apply_a_power(self.x, self.a, steps).cpu()
+        a_pow = torch.pow(self.a, steps)  # (M,)
+        x_pred = a_pow * self.x           # (M,)
+        return vectorize_complex(x_pred).cpu()
 
 
 # -------------------------
@@ -596,7 +666,6 @@ class KalmanNetGRU(nn.Module):
     def forward(self, x_in: torch.Tensor, w_out: int):
         B, q, D = x_in.shape
         dev = x_in.device
-        # better init than zeros for short horizon
         x_post = x_in[:, 0, :].clone()
         h = torch.zeros(B, self.H, device=dev)
         y_prev = x_in[:, 0, :]
@@ -645,10 +714,8 @@ class TCNResBlock(nn.Module):
         self.ln = nn.LayerNorm(ch)
 
     def forward(self, x):
-        # x: (B, ch, T)
         y = self.net(x)
         out = x + y
-        # layernorm over channel
         out = out.transpose(1, 2)
         out = self.ln(out)
         return out.transpose(1, 2)
@@ -661,22 +728,14 @@ class TDNNEncoderTCN(nn.Module):
         self.out_ln = nn.LayerNorm(H)
 
     def forward(self, x):
-        # x: (B,T,C) -> (B,C,T)
         x = x.transpose(1, 2)
         h = self.inp(x)
         for b in self.blocks:
             h = b(h)
-        h = h.transpose(1, 2)      # (B,T,H)
+        h = h.transpose(1, 2)
         return self.out_ln(h)
 
 class TDNNKalmanNet(nn.Module):
-    """
-    Upgraded TDNN-KalmanNet:
-      - features: y, dy, ddy
-      - TCN encoder
-      - update similar to KalmanNet
-      - rollout via GRUCell for stability
-    """
     def __init__(self, D: int, H: int = 256, blocks: int = 2, k: int = 3, drop: float = 0.1):
         super().__init__()
         self.D, self.H = D, H
@@ -691,9 +750,7 @@ class TDNNKalmanNet(nn.Module):
 
     def forward(self, x_in: torch.Tensor, w_out: int):
         B, q, D = x_in.shape
-        dev = x_in.device
 
-        # features (y, dy, ddy)
         feats = []
         y_prev = x_in[:, 0, :]
         dy_prev = torch.zeros_like(y_prev)
@@ -704,11 +761,10 @@ class TDNNKalmanNet(nn.Module):
             feats.append(torch.cat([y_t, dy, ddy], dim=1).unsqueeze(1))
             dy_prev = dy
             y_prev = y_t
-        feats = torch.cat(feats, dim=1)   # (B,q,3D)
+        feats = torch.cat(feats, dim=1)
 
-        h_seq = self.enc(feats)           # (B,q,H)
+        h_seq = self.enc(feats)
 
-        # init from observation (helps short horizon)
         x_post = x_in[:, 0, :].clone()
         for t in range(q):
             y_t = x_in[:, t, :]
@@ -734,9 +790,6 @@ class TDNNKalmanNet(nn.Module):
         return torch.cat(preds, dim=1)
 
 class SCP_Seq2Seq(nn.Module):
-    """
-    SCP baseline (improved): Encoder LSTM + Decoder LSTMCell with dot-attention + teacher forcing.
-    """
     def __init__(self, D: int, w_out: int, H: int = 256, layers: int = 2, dropout: float = 0.25):
         super().__init__()
         self.D, self.w_out, self.H = D, w_out, H
@@ -748,20 +801,17 @@ class SCP_Seq2Seq(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def _attend(self, enc_out: torch.Tensor, h: torch.Tensor):
-        # enc_out: (B,q,H), h: (B,H)
-        # dot-product attention
-        score = torch.bmm(enc_out, h.unsqueeze(2)).squeeze(2) / math.sqrt(self.H)  # (B,q)
-        w = torch.softmax(score, dim=1).unsqueeze(2)                               # (B,q,1)
-        ctx = torch.sum(w * enc_out, dim=1)                                        # (B,H)
+        score = torch.bmm(enc_out, h.unsqueeze(2)).squeeze(2) / math.sqrt(self.H)
+        w = torch.softmax(score, dim=1).unsqueeze(2)
+        ctx = torch.sum(w * enc_out, dim=1)
         return ctx
 
     def forward(self, x_in: torch.Tensor, w_out: int, y_teacher: Optional[torch.Tensor] = None, tf_ratio: float = 0.0):
-        B, q, D = x_in.shape
         enc_out, (h_n, c_n) = self.enc(x_in)
         h = h_n[-1]
         c = c_n[-1]
 
-        prev_y = x_in[:, -1, :]  # seed with last observed
+        prev_y = x_in[:, -1, :]
         outs = []
         for t in range(w_out):
             ctx = self._attend(enc_out, h)
@@ -780,7 +830,7 @@ class SCP_Seq2Seq(nn.Module):
 
 
 # -------------------------
-# 6) Training (horizon-weighted MSE)
+# 6) Training
 # -------------------------
 def train_model(cfg: SimCfg, model: nn.Module, name: str, outdir: str, train_ds, val_ds, num_workers: int = 0):
     print(f"\n🧠 Training {name} | q={cfg.q_in} | L={cfg.w_out} | ep={cfg.epochs} bs={cfg.batch_size}")
@@ -794,7 +844,6 @@ def train_model(cfg: SimCfg, model: nn.Module, name: str, outdir: str, train_ds,
     use_amp = cfg.device.startswith("cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=True) if use_amp else None
 
-    # loss weights
     w_h = cfg.horizon_loss_weights().to(cfg.device).view(1, cfg.w_out, 1)
 
     best_val, bad = 1e18, 0
@@ -882,7 +931,9 @@ def train_model(cfg: SimCfg, model: nn.Module, name: str, outdir: str, train_ds,
 @torch.no_grad()
 def eval_nmse_horizon(cfg: SimCfg, models: Dict[str, Optional[nn.Module]], val_ds: SliceDataset, A: int, trials: int = 2000):
     nmse = {k: np.zeros(cfg.w_out) for k in models.keys()}
-    kf = AR1KalmanScalar(D=cfg.feat_dim, snr_db=cfg.pilot_snr_db)
+
+    kf = SimpleKalmanAR1_DiagComplex(cfg=cfg)
+
 
     N = len(val_ds)
     idxs = np.random.choice(N, size=min(trials, N), replace=False)
@@ -1003,7 +1054,6 @@ def train_and_eval_one(base_dir: str, cfg: SimCfg, exp_tag: str, force_data: boo
         print(f"\n⏱️ Delay: alt={cfg.fixed_alt_km} km | delay_mode={cfg.delay_mode}")
         print(f"   delay_ms = {delay_ms:.2f} ms  | Ts = {cfg.coherence_ms:.2f} ms  -> A = {A} slots")
 
-        # Save cfg
         cfg_dump = asdict(cfg)
         cfg_dump["delay_calc"] = {"alt_km": cfg.fixed_alt_km, "delay_mode": cfg.delay_mode, "delay_ms": float(delay_ms),
                                   "Ts_ms": float(cfg.coherence_ms), "A_slots": int(A)}
@@ -1012,7 +1062,6 @@ def train_and_eval_one(base_dir: str, cfg: SimCfg, exp_tag: str, force_data: boo
             json.dump(cfg_dump, f, indent=2, ensure_ascii=False)
         print("\n🧾 cfg saved:", cfg_path, "|", file_exists_and_size(cfg_path))
 
-        # Dataset
         _, pack = get_or_make_dataset(base_dir, cfg, A, force=force_data)
         Xtr, Ytr = pack["train"]["X"], pack["train"]["Y"]
         Xva, Yva = pack["val"]["X"], pack["val"]["Y"]
@@ -1020,7 +1069,6 @@ def train_and_eval_one(base_dir: str, cfg: SimCfg, exp_tag: str, force_data: boo
         train_ds = SliceDataset(Xtr, Ytr)
         val_ds = SliceDataset(Xva, Yva)
 
-        # Models
         D = cfg.feat_dim
         blocks = cfg.pick_tdnn_blocks()
         print(f"\n🧩 TDNN blocks auto = {blocks} (q={cfg.q_in})")
@@ -1029,14 +1077,12 @@ def train_and_eval_one(base_dir: str, cfg: SimCfg, exp_tag: str, force_data: boo
         knet = KalmanNetGRU(D, H=cfg.knet_hidden)
         scp = SCP_Seq2Seq(D, w_out=cfg.w_out, H=cfg.scp_hidden, layers=cfg.scp_layers, dropout=cfg.dropout)
 
-        # Train
         t0 = time.time()
         tdnn_knet = train_model(cfg, tdnn_knet, "TDNN_KalmanNet", outdir, train_ds, val_ds, num_workers=num_workers)
         knet = train_model(cfg, knet, "KalmanNet_GRU", outdir, train_ds, val_ds, num_workers=num_workers)
         scp = train_model(cfg, scp, "SCP_Seq2Seq", outdir, train_ds, val_ds, num_workers=num_workers)
         print(f"⏱️ Total training (this scenario): {(time.time()-t0)/60.0:.2f} min")
 
-        # Eval
         eval_models = {
             "TDNN-KalmanNet": tdnn_knet.eval(),
             "KalmanNet": knet.eval(),
@@ -1046,7 +1092,6 @@ def train_and_eval_one(base_dir: str, cfg: SimCfg, exp_tag: str, force_data: boo
         }
         nmse_curve = eval_nmse_horizon(cfg, eval_models, val_ds, A=A, trials=cfg.horizon_trials)
 
-        # Save
         nmse_raw_csv = os.path.join(outdir, "nmse_vs_predslots_raw.csv")
         save_csv_nmse_raw(nmse_raw_csv, nmse_curve)
 
@@ -1095,6 +1140,13 @@ def train_and_eval_one(base_dir: str, cfg: SimCfg, exp_tag: str, force_data: boo
                     "A_slots": int(A),
                     "Ts_ms": float(cfg.coherence_ms),
                     "doppler_hz_minmax": [float(cfg.ut_doppler_hz_min), float(cfg.ut_doppler_hz_max)],
+                    "kf": {
+                        "kf_debias_mmse": cfg.kf_debias_mmse,
+                        "kf_a_mode": cfg.kf_a_mode,
+                        "kf_a_smooth": cfg.kf_a_smooth,
+                        "kf_Q": cfg.kf_Q,
+                        "kf_R_scale": cfg.kf_R_scale,
+                    },
                     "params": params,
                     "model_size_mb": size_mb,
                     "latency_ms": latency,
@@ -1143,11 +1195,9 @@ def parse_q_list(s: str) -> List[int]:
     return xs
 
 def apply_scenario(cfg: SimCfg, scenario: str) -> SimCfg:
-    # baseline: close to your previous setting
     if scenario == "baseline":
         return cfg
 
-    # tdnn_adv: fairly penalize scalar KF and reward TDNN structure
     if scenario == "tdnn_adv":
         return replace(
             cfg,
@@ -1164,11 +1214,11 @@ def apply_scenario(cfg: SimCfg, scenario: str) -> SimCfg:
             gain_ar_std=0.08,
             pilot_outlier_prob=0.02,
             pilot_outlier_scale=8.0,
-            # loss weighting to separate tail more
             loss_tail_weight=2.0,
             loss_first_boost=1.0,
-            # slightly more training stability
             lr=min(cfg.lr, 8e-4),
+            # mismatch bigger -> KF needs bigger Q typically
+            kf_Q=max(cfg.kf_Q, 4e-3),
         )
 
     return cfg
@@ -1184,8 +1234,7 @@ def main():
     parser.add_argument("--dop_min", type=float, default=50.0, help="residual doppler min (Hz)")
     parser.add_argument("--dop_max", type=float, default=100.0, help="residual doppler max (Hz)")
     parser.add_argument("--Ts_ms", type=float, default=1.0, help="coherence interval Ts (ms)")
-    parser.add_argument("--scenario", type=str, default="baseline", choices=["baseline", "tdnn_adv"],
-                        help="baseline or tdnn_adv (penalize scalar KF fairly)")
+    parser.add_argument("--scenario", type=str, default="baseline", choices=["baseline", "tdnn_adv"])
     parser.add_argument("--no_latency", action="store_true", help="disable latency measurement")
 
     if in_notebook():
@@ -1245,6 +1294,7 @@ def main():
         print(f"🚀 Running: {tag}")
         print(f"   TDNN blocks auto = {cfg.pick_tdnn_blocks()}  (q={cfg.q_in})")
         print(f"   oneway delay_ms={delay_ms:.2f}, A={A} slots")
+        print(f"   KF: debias={cfg.kf_debias_mmse}, a_mode={cfg.kf_a_mode}, Q={cfg.kf_Q}, Rscale={cfg.kf_R_scale}")
         train_and_eval_one(args.base_dir, cfg, exp_tag=tag, force_data=args.force_data, num_workers=args.num_workers)
 
     print("\n🎉 All done!")
