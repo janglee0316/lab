@@ -231,7 +231,9 @@ class SimCfg:
     # Eval
     horizon_trials: int = 2000
 
-    # Delay settings (forced oneway)
+    # Effective CSI aging delay settings
+    # A = ceil(tau_eff / Ts). If tau_eff_ms <= 0, fallback to altitude-based one-way delay.
+    tau_eff_ms: float = 5.0
     delay_mode: str = "oneway"
     fixed_alt_km: int = 1500
 
@@ -268,11 +270,14 @@ class SimCfg:
     @property
     def Ts_s(self): return self.coherence_ms * 1e-3
 
-    def delay_steps_from_alt_km(self, alt_km: int) -> Tuple[float, int]:
-        delay_ms = alt_km / 300.0
-        if self.delay_mode == "roundtrip":
-            delay_ms *= 2.0
-        steps = max(1, int(round(delay_ms / self.coherence_ms)))
+    def effective_delay_steps(self) -> Tuple[float, int]:
+        if self.tau_eff_ms > 0.0:
+            delay_ms = float(self.tau_eff_ms)
+        else:
+            delay_ms = self.fixed_alt_km / 300.0
+            if self.delay_mode == "roundtrip":
+                delay_ms *= 2.0
+        steps = max(1, int(math.ceil(delay_ms / max(1e-12, self.coherence_ms))))
         return delay_ms, steps
 
     def pick_tdnn_blocks(self) -> int:
@@ -305,8 +310,8 @@ class LEOMassiveMIMOChannel:
         kd = math.pi
         mx = torch.arange(self.cfg.Mx, device=self.device)
         my = torch.arange(self.cfg.My, device=self.device)
-        phase_x = 1j * kd * torch.sin(theta) * torch.cos(phi) * mx
-        phase_y = 1j * kd * torch.sin(theta) * torch.sin(phi) * my
+        phase_x = -1j * kd * torch.cos(theta) * torch.sin(phi) * mx
+        phase_y = -1j * kd * torch.cos(theta) * torch.cos(phi) * my
         ux = torch.exp(phase_x)
         uy = torch.exp(phase_y)
         u = torch.kron(ux, uy)
@@ -416,7 +421,7 @@ def dataset_path(base_dir: str, cfg: SimCfg, A: int):
         f"K{safe_float_tag(cfg.rician_K_db)}_P{cfg.num_paths}_"
         f"aoaRW{safe_float_tag(cfg.aoa_rw_std_deg)}_dopRW{safe_float_tag(cfg.doppler_rw_std_hz)}_"
         f"out{safe_float_tag(cfg.pilot_outlier_prob)}_"
-        f"delay{cfg.delay_mode}_alt{cfg.fixed_alt_km}"
+        f"teff{safe_float_tag(cfg.tau_eff_ms)}_delay{cfg.delay_mode}_alt{cfg.fixed_alt_km}"
     )
     return os.path.join(base_dir, "datasets", f"dataset_{tag}.pt")
 
@@ -1043,8 +1048,8 @@ def plot_rate_curve_w_axis(cfg: SimCfg, A: int, rate_curve: Dict[str, np.ndarray
     plt.grid(alpha=0.3)
     plt.xlabel("w = A + t  (coherence intervals)")
     plt.ylabel("Spectral Efficiency (bps/Hz) [MRT proxy]")
-    delay_ms, _ = cfg.delay_steps_from_alt_km(cfg.fixed_alt_km)
-    plt.title(title + f"\nalt={cfg.fixed_alt_km}km | delay_ms={delay_ms:.2f} | Ts={cfg.coherence_ms:.2f}ms | A={A}")
+    delay_ms, _ = cfg.effective_delay_steps()
+    plt.title(title + f"\ntau_eff={delay_ms:.2f}ms | Ts={cfg.coherence_ms:.2f}ms | A={A}")
     plt.legend()
     plt.tight_layout()
     plt.savefig(save_path, dpi=200)
@@ -1067,9 +1072,9 @@ def plot_nmse_curve_w_axis(cfg: SimCfg, A: int, nmse_curve: Dict[str, np.ndarray
     plt.grid(alpha=0.3)
     plt.xlabel("w = A + t  (coherence intervals)")
     plt.ylabel("NMSE (dB)")
-    delay_ms, _ = cfg.delay_steps_from_alt_km(cfg.fixed_alt_km)
+    delay_ms, _ = cfg.effective_delay_steps()
     Ts = cfg.coherence_ms
-    plt.title(title + f"\nalt={cfg.fixed_alt_km}km | delay_ms={delay_ms:.2f} | Ts={Ts:.2f}ms | dop={cfg.ut_doppler_hz_min}-{cfg.ut_doppler_hz_max}Hz | A={A}")
+    plt.title(title + f"\ntau_eff={delay_ms:.2f}ms | Ts={Ts:.2f}ms | dop={cfg.ut_doppler_hz_min}-{cfg.ut_doppler_hz_max}Hz | A={A}")
     plt.legend()
     plt.tight_layout()
     plt.savefig(save_path, dpi=200)
@@ -1184,12 +1189,14 @@ def train_and_eval_one(base_dir: str, cfg: SimCfg, exp_tag: str, force_data: boo
         print("🧾 Experiment folder:", outdir)
         print("🧾 Log file:", log_path)
 
-        delay_ms, A = cfg.delay_steps_from_alt_km(cfg.fixed_alt_km)
-        print(f"\n⏱️ Delay: alt={cfg.fixed_alt_km} km | delay_mode={cfg.delay_mode}")
-        print(f"   delay_ms = {delay_ms:.2f} ms  | Ts = {cfg.coherence_ms:.2f} ms  -> A = {A} slots")
+        delay_ms, A = cfg.effective_delay_steps()
+        print(f"\n⏱️ Effective CSI aging delay: tau_eff={delay_ms:.2f} ms")
+        print(f"   Ts = {cfg.coherence_ms:.2f} ms  -> A = ceil(tau_eff/Ts) = {A} slots")
+        if cfg.tau_eff_ms <= 0.0:
+            print(f"   (fallback) alt={cfg.fixed_alt_km} km | delay_mode={cfg.delay_mode}")
 
         cfg_dump = asdict(cfg)
-        cfg_dump["delay_calc"] = {"alt_km": cfg.fixed_alt_km, "delay_mode": cfg.delay_mode, "delay_ms": float(delay_ms),
+        cfg_dump["delay_calc"] = {"tau_eff_ms": float(delay_ms), "alt_km": cfg.fixed_alt_km, "delay_mode": cfg.delay_mode, "delay_ms": float(delay_ms),
                                   "Ts_ms": float(cfg.coherence_ms), "A_slots": int(A)}
         cfg_path = os.path.join(outdir, "cfg.json")
         with open(cfg_path, "w", encoding="utf-8") as f:
@@ -1403,6 +1410,7 @@ def main():
     parser.add_argument("--force_data", action="store_true", help="regenerate datasets")
     parser.add_argument("--q_list", type=str, default="4,15", help="comma-separated q values, e.g., 4,15")
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader num_workers")
+    parser.add_argument("--tau_eff_ms", type=float, default=5.0, help="effective CSI delay budget in ms (A=ceil(tau_eff/Ts)); set <=0 to use altitude-based delay")
     parser.add_argument("--alt_km", type=int, default=1500, help="fixed altitude for delay axis")
     parser.add_argument("--w_out", type=int, default=15, help="prediction horizon L")
     parser.add_argument("--dop_min", type=float, default=50.0, help="residual doppler min (Hz)")
@@ -1433,7 +1441,8 @@ def main():
     print(f"📌 base_dir     = {args.base_dir}")
     print(f"📌 device       = {'cuda' if torch.cuda.is_available() else 'cpu'}")
     print(f"📌 q_list       = {q_values}")
-    print(f"📌 fixed alt_km = {args.alt_km}")
+    print(f"📌 tau_eff_ms   = {args.tau_eff_ms}")
+    print(f"📌 fixed alt_km = {args.alt_km}  (used only if tau_eff_ms <= 0)")
     print(f"📌 w_out        = {args.w_out}")
     print(f"📌 doppler      = {args.dop_min}~{args.dop_max} Hz (residual)")
     print(f"📌 Ts_ms        = {args.Ts_ms}")
@@ -1444,6 +1453,7 @@ def main():
             SimCfg(),
             q_in=int(q),
             w_out=int(args.w_out),
+            tau_eff_ms=float(args.tau_eff_ms),
             delay_mode="oneway",
             fixed_alt_km=int(args.alt_km),
             ut_doppler_hz_min=float(args.dop_min),
@@ -1453,10 +1463,10 @@ def main():
         )
         cfg = apply_scenario(cfg, args.scenario)
 
-        delay_ms, A = cfg.delay_steps_from_alt_km(cfg.fixed_alt_km)
+        delay_ms, A = cfg.effective_delay_steps()
 
         tag = (
-            f"{args.scenario}_ALT{cfg.fixed_alt_km}_q{cfg.q_in}_A{A}_L{cfg.w_out}_"
+            f"{args.scenario}_TEFF{safe_float_tag(delay_ms)}_q{cfg.q_in}_A{A}_L{cfg.w_out}_"
             f"dop{safe_float_tag(cfg.ut_doppler_hz_min)}to{safe_float_tag(cfg.ut_doppler_hz_max)}_"
             f"Ts{safe_float_tag(cfg.coherence_ms)}_snr{int(cfg.pilot_snr_db)}_"
             f"K{safe_float_tag(cfg.rician_K_db)}_P{cfg.num_paths}_"
@@ -1467,7 +1477,7 @@ def main():
         print("\n" + "=" * 80)
         print(f"🚀 Running: {tag}")
         print(f"   TDNN blocks auto = {cfg.pick_tdnn_blocks()}  (q={cfg.q_in})")
-        print(f"   oneway delay_ms={delay_ms:.2f}, A={A} slots")
+        print(f"   tau_eff={delay_ms:.2f}ms, A={A} slots")
         print(f"   KF: debias={cfg.kf_debias_mmse}, a_mode={cfg.kf_a_mode}, Q={cfg.kf_Q}, Rscale={cfg.kf_R_scale}")
         train_and_eval_one(args.base_dir, cfg, exp_tag=tag, force_data=args.force_data, num_workers=args.num_workers)
 
